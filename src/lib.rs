@@ -236,6 +236,7 @@ struct RawContract {
 /// ]
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawCapability {
     kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -485,12 +486,48 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         // 4. Declared contract versions must be compatible with the core.
         for (contract, version) in &m.implements {
             if !core.is_compatible(contract, version) {
+                // Distinguish the common "minor too low" case (same major, but the
+                // plugin declares an older minor than core requires) from a true
+                // major/contract mismatch, since the generic wording is misleading
+                // when the plugin simply needs to bump its minor.
+                let detail = match core.0.get(contract.as_str()) {
+                    Some(core_ver)
+                        if version.major == core_ver.major && version.minor < core_ver.minor =>
+                    {
+                        format!(
+                            "plugin minor too low: declares v{version} but core requires \
+                             at least v{}.{}.0",
+                            core_ver.major, core_ver.minor
+                        )
+                    }
+                    Some(core_ver) => format!(
+                        "incompatible with core's v{core_ver} for this contract"
+                    ),
+                    None => "unknown contract not provided by core".to_string(),
+                };
                 return Err(ConfigError::Validation(format!(
-                    "plugin '{}' declares contract '{}' v{} incompatible with core v0.1",
-                    m.name, contract, version
+                    "plugin '{}' declares contract '{}' v{} — {}",
+                    m.name, contract, version, detail
                 )));
             }
         }
+    }
+
+    // 5. The `[security]` table's file-capability prefixes are themselves paths
+    // and must not smuggle `..` traversal, consistent with how plugin file
+    // capabilities are screened in step 3. (`network_allowlist` entries are
+    // hosts, not paths, so they are intentionally left unscreened.)
+    for prefix in cfg
+        .security
+        .file_read_prefixes
+        .iter()
+        .chain(&cfg.security.file_write_prefixes)
+    {
+        validate_db_path(prefix).map_err(|_| {
+            ConfigError::Validation(format!(
+                "[security] prefix '{prefix}' contains path traversal"
+            ))
+        })?;
     }
 
     Ok(())
@@ -791,7 +828,53 @@ capabilities = [{ kind = "file_read", target = "/tmp/../etc" }]
         assert!(matches!(validate(&cfg), Err(ConfigError::Validation(_))));
     }
 
+    #[test]
+    fn rejects_path_traversal_in_security_prefix() {
+        // A `[security]` prefix that escapes via `..` must be rejected, just like
+        // a plugin file-capability target (finding: prefixes were unscreened).
+        let cfg = from_str(
+            r#"
+[security]
+file_read_prefixes = ["../.."]
+"#,
+        )
+        .expect("parse");
+        match validate(&cfg) {
+            Err(ConfigError::Validation(msg)) => {
+                assert!(msg.contains("[security]") && msg.contains("traversal"), "got {msg}")
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+
+        // A write prefix with traversal is caught too.
+        let cfg = from_str(
+            r#"
+[security]
+file_write_prefixes = ["/var/data/../../etc"]
+"#,
+        )
+        .expect("parse");
+        assert!(matches!(validate(&cfg), Err(ConfigError::Validation(_))));
+    }
+
     // ---- Parser-level errors -------------------------------------------------
+
+    #[test]
+    fn rejects_unknown_capability_key() {
+        // A typo'd key inside a capability entry must be a hard parse error
+        // (RawCapability now uses `deny_unknown_fields`), not a silent ignore.
+        let err = from_str(
+            r#"
+[[plugin]]
+name    = "x"
+version = "0.1.0"
+class   = "unsafe"
+capabilities = [{ kind = "file_read", targett = "/tmp" }]
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)), "got {err:?}");
+    }
 
     #[test]
     fn rejects_unknown_capability_kind() {
