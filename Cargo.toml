@@ -1,0 +1,13 @@
+[package]
+name = "wyrtloom-config"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+wyrtloom-core = { path = "../wyrtloom/crates/core" }
+# Portable alternative: wyrtloom-core = { git = "https://github.com/codepilots/wyrtloom.git", rev = "<sha>" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+thiserror = "1"
